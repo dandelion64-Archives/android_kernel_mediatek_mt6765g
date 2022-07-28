@@ -1344,6 +1344,14 @@ void snd_usb_ctl_msg_quirk(struct usb_device *dev, unsigned int pipe,
 	     chip->usb_id == USB_ID(0x0951, 0x16ad)) &&
 	    (requesttype & USB_TYPE_MASK) == USB_TYPE_CLASS)
 		usleep_range(1000, 2000);
+
+	/*
+	 * Samsung USBC Headset (AKG) need a tiny delay after each
+	 * class compliant request. (Model number: AAM625R or AAM627R)
+	 */
+	if (chip->usb_id == USB_ID(0x04e8, 0xa051) &&
+	    (requesttype & USB_TYPE_MASK) == USB_TYPE_CLASS)
+		usleep_range(5000, 6000);
 }
 
 /*
@@ -1498,4 +1506,19 @@ void snd_usb_audioformat_attributes_quirk(struct snd_usb_audio *chip,
 			fp->ep_attr |= USB_ENDPOINT_SYNC_SYNC;
 		break;
 	}
+}
+
+bool snd_usb_support_autosuspend_quirk(struct usb_device *dev)
+{
+	struct snd_usb_audio *chip = dev_get_drvdata(&dev->dev);
+
+	if (!chip)
+		return false;
+
+	switch (chip->usb_id) {
+	case USB_ID(0x1963, 0x0020):
+		dev_info(&dev->dev, "snd device not support autosuspend");
+		return false;
+	}
+	return true;
 }
