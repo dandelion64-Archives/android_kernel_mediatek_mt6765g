@@ -22,7 +22,16 @@ void schedtune_dequeue_task(struct task_struct *p, int cpu);
 
 unsigned long stune_util(int cpu, unsigned long other_util);
 
-#else /* CONFIG_SCHED_TUNE */
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+extern struct schedtune root_schedtune;
+struct uclamp_se
+uclamp_st_restrict(struct task_struct *p, enum uclamp_id clamp_id);
+
+void init_root_st_uclamp(int clamp_id);
+void uclamp_update_root_st(void);
+
+#endif
+#else
 
 #define schedtune_cpu_boost(cpu)  0
 #define schedtune_task_boost(tsk) 0
