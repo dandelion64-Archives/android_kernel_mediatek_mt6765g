@@ -237,7 +237,7 @@ static struct binder_transaction_log_entry *binder_transaction_log_add(
 struct binder_work {
 	struct list_head entry;
 
-	enum {
+	enum binder_work_type {
 		BINDER_WORK_TRANSACTION = 1,
 		BINDER_WORK_TRANSACTION_COMPLETE,
 		BINDER_WORK_RETURN_ERROR,
@@ -617,7 +617,55 @@ struct binder_transaction {
 	 * during thread teardown
 	 */
 	spinlock_t lock;
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+	struct timespec timestamp;
+	struct timeval tv;
+#endif
 };
+
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+/*
+ * binder_print_delay - Output info of a delay transaction
+ * @t:          pointer to the over-time transaction
+ */
+static void binder_print_delay(struct binder_transaction *t)
+{
+	struct rtc_time tm;
+	struct timespec *startime;
+	struct timespec cur, sub_t;
+
+	ktime_get_ts(&cur);
+	startime = &t->timestamp;
+	sub_t = timespec_sub(cur, *startime);
+	/* if transaction time is over than 2 sec,
+	 * show timeout warning log.
+	 */
+	if (sub_t.tv_sec < 2)
+		return;
+	rtc_time_to_tm(t->tv.tv_sec, &tm);
+	spin_lock(&t->lock);
+	pr_info_ratelimited("%d: from %d:%d to %d:%d",
+			t->debug_id,
+			t->from ? t->from->proc->pid : 0,
+			t->from ? t->from->pid : 0,
+			t->to_proc ? t->to_proc->pid : 0,
+			t->to_thread ? t->to_thread->pid : 0);
+	spin_unlock(&t->lock);
+	pr_info_ratelimited(" total %u.%03ld s code %u start %lu.%03ld android %d-%02d-%02d %02d:%02d:%02d.%03lu\n",
+			(unsigned int)sub_t.tv_sec,
+			(sub_t.tv_nsec / NSEC_PER_MSEC),
+			t->code,
+			(unsigned long)startime->tv_sec,
+			(startime->tv_nsec / NSEC_PER_MSEC),
+			(tm.tm_year + 1900), (tm.tm_mon + 1), tm.tm_mday,
+			tm.tm_hour, tm.tm_min, tm.tm_sec,
+			(unsigned long)(t->tv.tv_usec / USEC_PER_MSEC));
+}
+#else
+static void binder_print_delay(struct binder_transaction *t)
+{
+}
+#endif
 
 /**
  * struct binder_object - union of flat binder object types
@@ -894,27 +942,6 @@ static struct binder_work *binder_dequeue_work_head_ilocked(
 	w = list_first_entry_or_null(list, struct binder_work, entry);
 	if (w)
 		list_del_init(&w->entry);
-	return w;
-}
-
-/**
- * binder_dequeue_work_head() - Dequeues the item at head of list
- * @proc:         binder_proc associated with list
- * @list:         list to dequeue head
- *
- * Removes the head of the list if there are items on the list
- *
- * Return: pointer dequeued binder_work, NULL if list was empty
- */
-static struct binder_work *binder_dequeue_work_head(
-					struct binder_proc *proc,
-					struct list_head *list)
-{
-	struct binder_work *w;
-
-	binder_inner_proc_lock(proc);
-	w = binder_dequeue_work_head_ilocked(list);
-	binder_inner_proc_unlock(proc);
 	return w;
 }
 
@@ -2094,6 +2121,7 @@ static void binder_free_transaction(struct binder_transaction *t)
 			t->buffer->transaction = NULL;
 		binder_inner_proc_unlock(target_proc);
 	}
+	binder_print_delay(t);
 	/*
 	 * If the transaction has no target_proc, then
 	 * t->buffer->transaction has already been cleared.
@@ -2975,7 +3003,13 @@ static void binder_transaction(struct binder_proc *proc,
 	e->data_size = tr->data_size;
 	e->offsets_size = tr->offsets_size;
 	e->context_name = proc->context->name;
-
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+	ktime_get_ts(&e->timestamp);
+	/* monotonic_to_bootbased(&e->timestamp); */
+	do_gettimeofday(&e->tv);
+	/* consider time zone. translate to android time */
+	e->tv.tv_sec -= (sys_tz.tz_minuteswest * 60);
+#endif
 	if (reply) {
 		binder_inner_proc_lock(proc);
 		in_reply_to = thread->transaction_stack;
@@ -3159,6 +3193,13 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_alloc_t_failed;
 	}
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+	memcpy(&t->timestamp, &e->timestamp, sizeof(struct timespec));
+	/* do_gettimeofday(&t->tv); */
+	/* consider time zone. translate to android time */
+	/* t->tv.tv_sec -= (sys_tz.tz_minuteswest * 60); */
+	memcpy(&t->tv, &e->tv, sizeof(struct timeval));
+#endif
 	binder_stats_created(BINDER_STAT_TRANSACTION);
 	spin_lock_init(&t->lock);
 
@@ -3588,6 +3629,7 @@ err_get_secctx_failed:
 	kfree(tcomplete);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
 err_alloc_tcomplete_failed:
+	binder_print_delay(t);
 	kfree(t);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION);
 err_alloc_t_failed:
@@ -4552,13 +4594,17 @@ static void binder_release_work(struct binder_proc *proc,
 				struct list_head *list)
 {
 	struct binder_work *w;
+	enum binder_work_type wtype;
 
 	while (1) {
-		w = binder_dequeue_work_head(proc, list);
+		binder_inner_proc_lock(proc);
+		w = binder_dequeue_work_head_ilocked(list);
+		wtype = w ? w->type : 0;
+		binder_inner_proc_unlock(proc);
 		if (!w)
 			return;
 
-		switch (w->type) {
+		switch (wtype) {
 		case BINDER_WORK_TRANSACTION: {
 			struct binder_transaction *t;
 
@@ -4592,9 +4638,11 @@ static void binder_release_work(struct binder_proc *proc,
 			kfree(death);
 			binder_stats_deleted(BINDER_STAT_DEATH);
 		} break;
+		case BINDER_WORK_NODE:
+			break;
 		default:
 			pr_err("unexpected work type, %d, not freed\n",
-			       w->type);
+			       wtype);
 			break;
 		}
 	}
@@ -4664,8 +4712,15 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc)
 
 static void binder_free_proc(struct binder_proc *proc)
 {
+	struct binder_device *device;
+
 	BUG_ON(!list_empty(&proc->todo));
 	BUG_ON(!list_empty(&proc->delivered_death));
+	device = container_of(proc->context, struct binder_device, context);
+	if (refcount_dec_and_test(&device->ref)) {
+		kfree(proc->context->name);
+		kfree(device);
+	}
 	binder_alloc_deferred_release(&proc->alloc);
 	put_task_struct(proc->tsk);
 	binder_stats_deleted(BINDER_STAT_PROC);
@@ -5393,7 +5448,6 @@ static int binder_node_release(struct binder_node *node, int refs)
 static void binder_deferred_release(struct binder_proc *proc)
 {
 	struct binder_context *context = proc->context;
-	struct binder_device *device;
 	struct rb_node *n;
 	int threads, nodes, incoming_refs, outgoing_refs, active_transactions;
 
@@ -5412,12 +5466,6 @@ static void binder_deferred_release(struct binder_proc *proc)
 		context->binder_context_mgr_node = NULL;
 	}
 	mutex_unlock(&context->context_mgr_node_lock);
-	device = container_of(proc->context, struct binder_device, context);
-	if (refcount_dec_and_test(&device->ref)) {
-		kfree(context->name);
-		kfree(device);
-	}
-	proc->context = NULL;
 	binder_inner_proc_lock(proc);
 	/*
 	 * Make sure proc stays alive after we
@@ -5545,6 +5593,11 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 {
 	struct binder_proc *to_proc;
 	struct binder_buffer *buffer = t->buffer;
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+	struct rtc_time tm;
+
+	rtc_time_to_tm(t->tv.tv_sec, &tm);
+#endif
 
 	spin_lock(&t->lock);
 	to_proc = t->to_proc;
@@ -5557,6 +5610,15 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 		   t->to_thread ? t->to_thread->pid : 0,
 		   t->code, t->flags, t->priority.sched_policy,
 		   t->priority.prio, t->need_reply);
+#ifdef CONFIG_ANDROID_BINDER_USER_TRACKING
+	seq_printf(m,
+		   " start %lu.%06lu android %d-%02d-%02d %02d:%02d:%02d.%03lu",
+		   (unsigned long)t->timestamp.tv_sec,
+		   (t->timestamp.tv_nsec / NSEC_PER_USEC),
+		   (tm.tm_year + 1900), (tm.tm_mon + 1), tm.tm_mday,
+		   tm.tm_hour, tm.tm_min, tm.tm_sec,
+		   (unsigned long)(t->tv.tv_usec / USEC_PER_MSEC));
+#endif
 	spin_unlock(&t->lock);
 
 	if (proc != to_proc) {
